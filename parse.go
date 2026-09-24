@@ -2,6 +2,7 @@ package formstream
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +24,18 @@ var (
 
 // Parse parses the multipart form from r.
 func (p *Parser) Parse(r io.Reader) (err error) {
+	return p.ParseContext(context.Background(), r)
+}
+
+// ParseContext parses the multipart form from r. If ctx is canceled while
+// parsing is in progress, ParseContext aborts the parse and returns an error
+// that satisfies errors.Is(err, ctx.Err()).
+//
+// Reads from r are pumped through an internal pipe so that a blocked read is
+// released on cancellation; the pump goroutine and the pipe always exit
+// before ParseContext returns, provided r itself observes the cancellation
+// or reaches EOF.
+func (p *Parser) ParseContext(ctx context.Context, r io.Reader) (err error) {
 	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
 	defer func() {
 		deferErr := hsc.Close()
@@ -35,6 +48,14 @@ func (p *Parser) Parse(r io.Reader) (err error) {
 			}
 		}
 	}()
+
+	if ctx.Done() != nil {
+		cr := newCancelableReader(ctx, r)
+		defer func() {
+			_ = cr.Close()
+		}()
+		r = cr
+	}
 
 	err = p.parse(r, hsc.IConditionJudger)
 
