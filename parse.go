@@ -173,6 +173,7 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 		if pp.file == nil {
 			f, err := os.CreateTemp("", "formstream-")
 			if err != nil {
+				bufPool.Put(buf)
 				return nil, fmt.Errorf("failed to create temp file: %w", err)
 			}
 			pp.file = f
@@ -180,11 +181,13 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 
 		bufSize, err := io.Copy(pp.file, buf)
 		if err != nil {
+			bufPool.Put(buf)
 			return nil, fmt.Errorf("failed to write: %w", err)
 		}
 
 		remainSize, err := io.Copy(pp.file, normalParam.r)
 		if err != nil {
+			bufPool.Put(buf)
 			return nil, fmt.Errorf("failed to copy: %w", err)
 		}
 
