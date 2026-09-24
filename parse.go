@@ -2,6 +2,7 @@ package formstream
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +24,39 @@ var (
 
 // Parse parses the multipart form from r.
 func (p *Parser) Parse(r io.Reader) (err error) {
+	return p.ParseWithContext(context.Background(), r)
+}
+
+// ParseWithContext parses the multipart form from r, honoring ctx.
+//
+// When ctx is canceled, ParseWithContext returns promptly: the in-flight
+// stream hook and part readers are unblocked by closing the internal pipe,
+// the causal cancellation error (e.g. context.Canceled) is preserved on the
+// returned error, and any goroutine or temp resource used during parsing is
+// released. To guarantee that the goroutine feeding r exits after
+// cancellation, r should stop blocking Read when the parser no longer needs
+// it (e.g. an *io.PipeReader closed alongside ctx), as is the convention for
+// io.Reader-context interactions. The first error encountered is the only
+// error of its source: later cancellations and close errors never overwrite
+// it.
+func (p *Parser) ParseWithContext(ctx context.Context, r io.Reader) (err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// A dedicated pump goroutine decouples the caller's reader from parsing
+	// so context cancellation can unblock the parser side unilaterally.
+	pr, pw := io.Pipe()
+	pumpDone := make(chan struct{})
+	go func() {
+		defer close(pumpDone)
+		if _, err := io.Copy(pw, r); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		_ = pw.Close()
+	}()
+
 	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
 	defer func() {
 		deferErr := hsc.Close()
@@ -36,10 +70,37 @@ func (p *Parser) Parse(r io.Reader) (err error) {
 		}
 	}()
 
-	err = p.parse(r, hsc.IConditionJudger)
+	parseDone := make(chan struct{})
+	var parseErr error
+	go func() {
+		defer close(parseDone)
+		parseErr = p.parse(pr, hsc.IConditionJudger)
+	}()
+
+	select {
+	case <-parseDone:
+		err = parseErr
+	case <-ctx.Done():
+		// Report the cancellation once and make sure the parser goroutine
+		// leaves before returning by closing its reader. Waiting for pumpDone
+		// is intentionally avoided: a reader that blocks Read forever despite
+		// cancellation cannot be forced to stop (io convention); it will exit
+		// once its side releases the reader.
+		_ = pw.CloseWithError(ctx.Err())
+		<-parseDone
+		err = ctx.Err()
+		if parseErr != nil && !errors.Is(parseErr, context.Canceled) {
+			err = errors.Join(err, parseErr)
+		}
+	}
+	// Stop the pump's pipe write side so a lingering pump cannot write after
+	// the parse has finished; the first close error wins.
+	_ = pw.CloseWithError(errReaderClosed)
 
 	return
 }
+
+var errReaderClosed = errors.New("formstream: reader closed")
 
 func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
 	mr := multipart.NewReader(r, p.boundary)
