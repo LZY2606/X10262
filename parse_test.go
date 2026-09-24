@@ -392,6 +392,7 @@ func TestPreProcessor_run(t *testing.T) {
 					maxMemSize:     32,
 					maxMemFileSize: 32,
 				},
+				pool: defaultBufferPool,
 			}
 
 			for i, readerType := range tt.readerTypes {

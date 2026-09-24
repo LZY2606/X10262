@@ -2,6 +2,7 @@ package formstream
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +24,71 @@ var (
 
 // Parse parses the multipart form from r.
 func (p *Parser) Parse(r io.Reader) (err error) {
+	return p.ParseContext(context.Background(), r)
+}
+
+// ParseContext behaves like Parse but additionally honors ctx cancellation.
+// It runs the exact same parsing algorithm as Parse; the only added machinery
+// is a pipe transport between the source reader and the parser. On
+// cancellation both pipe ends are closed with the context cause, releasing any
+// blocked read inside a hook and any blocked pump write at once. The failure
+// is reported exactly once: the result is either the parsing/hook/source
+// error, or the context cause when ctx is canceled.
+func (p *Parser) ParseContext(ctx context.Context, r io.Reader) (err error) {
+	if err := ctx.Err(); err != nil {
+		return context.Cause(ctx)
+	}
+
+	// Without a cancellation channel the pipe would only add a goroutine and
+	// copies, so keep the original direct-read path byte-identical.
+	if ctx.Done() == nil {
+		return p.parseWithHooks(r)
+	}
+
+	pr, pw := io.Pipe()
+
+	pumpDone := make(chan struct{})
+	go func() {
+		defer close(pumpDone)
+		_, copyErr := io.Copy(pw, r)
+		// Closing the write end also unblocks the parser when it has already
+		// closed the read end because of a parsing error.
+		pw.CloseWithError(copyErr)
+	}()
+
+	stopWatch := make(chan struct{})
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		select {
+		case <-ctx.Done():
+			// Close both ends with the same cause: a blocked parser/hook read
+			// is released via pr, a blocked pump write via pw.
+			cause := context.Cause(ctx)
+			pr.CloseWithError(cause)
+			pw.CloseWithError(cause)
+		case <-stopWatch:
+		}
+	}()
+
+	parseErr := p.parseWithHooks(pr)
+	close(stopWatch)
+
+	select {
+	case <-ctx.Done():
+		// Cancellation owns the reported error.
+		parseErr = context.Cause(ctx)
+		pr.CloseWithError(parseErr)
+	default:
+		pr.CloseWithError(parseErr)
+	}
+	<-pumpDone
+	<-watchDone
+
+	return parseErr
+}
+
+func (p *Parser) parseWithHooks(r io.Reader) (err error) {
 	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
 	defer func() {
 		deferErr := hsc.Close()
@@ -121,6 +187,7 @@ func newHookSatisfactionChecker(streamHooks map[string]streamHook, config *parse
 
 	preProcess := &preProcessor{
 		config: config,
+		pool:   defaultBufferPool,
 	}
 
 	return &hookSatisfactionChecker{
@@ -147,24 +214,52 @@ type preProcessor struct {
 	config *parserConfig
 	offset int64
 	file   *os.File
+	// pool buffers the in-memory contents of parts whose hooks are still
+	// waiting for their required parts. Production parsers always use
+	// defaultBufferPool. It is a field rather than a package global solely so
+	// internal tests can observe get/put balance while exercising this exact
+	// same run path; no parsing logic differs between implementations.
+	pool bufferPool
 }
 
-var bufPool = sync.Pool{
+// bufferPool is the minimal seam used by preProcessor. The production
+// implementation is backed by a sync.Pool; tests may substitute a counting
+// implementation without duplicating any parsing logic.
+type bufferPool interface {
+	Get() *bytes.Buffer
+	Put(*bytes.Buffer)
+}
+
+type syncBufferPool struct{ p sync.Pool }
+
+var defaultBufferPool bufferPool = &syncBufferPool{
+	p: sync.Pool{
 	New: func() interface{} {
 		return new(bytes.Buffer)
 	},
+	},
+}
+
+func (sp *syncBufferPool) Get() *bytes.Buffer {
+	buf, ok := sp.p.Get().(*bytes.Buffer)
+	if !ok {
+		return new(bytes.Buffer)
+	}
+	return buf
+}
+
+func (sp *syncBufferPool) Put(buf *bytes.Buffer) {
+	sp.p.Put(buf)
 }
 
 func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
-	buf, ok := bufPool.Get().(*bytes.Buffer)
-	if !ok {
-		buf = new(bytes.Buffer)
-	}
+	buf := pp.pool.Get()
 	buf.Reset()
 
 	memLimit := min(pp.config.maxMemFileSize, pp.config.maxMemSize)
 	n, err := io.CopyN(buf, normalParam.r, int64(memLimit)+1)
 	if err != nil && !errors.Is(err, io.EOF) {
+		pp.pool.Put(buf)
 		return nil, fmt.Errorf("failed to copy: %w", err)
 	}
 
@@ -173,12 +268,14 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 		if pp.file == nil {
 			f, err := os.CreateTemp("", "formstream-")
 			if err != nil {
+				pp.pool.Put(buf)
 				return nil, fmt.Errorf("failed to create temp file: %w", err)
 			}
 			pp.file = f
 		}
 
 		bufSize, err := io.Copy(pp.file, buf)
+		pp.pool.Put(buf)
 		if err != nil {
 			return nil, fmt.Errorf("failed to write: %w", err)
 		}
@@ -192,7 +289,6 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 		content = io.NopCloser(io.NewSectionReader(pp.file, pp.offset, size))
 		pp.offset += size
 
-		bufPool.Put(buf)
 	} else {
 		pp.config.maxMemSize -= DataSize(buf.Len())
 		pp.config.maxMemFileSize -= DataSize(buf.Len())
@@ -200,7 +296,7 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 		content = customReadCloser{
 			Reader: buf,
 			closeFunc: func() error {
-				bufPool.Put(buf)
+				pp.pool.Put(buf)
 				pp.config.maxMemSize += DataSize(bufSize)
 				pp.config.maxMemFileSize += DataSize(bufSize)
 				return nil
