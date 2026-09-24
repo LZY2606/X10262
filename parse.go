@@ -2,6 +2,7 @@ package formstream
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -22,7 +23,21 @@ var (
 )
 
 // Parse parses the multipart form from r.
-func (p *Parser) Parse(r io.Reader) (err error) {
+// It is equivalent to ParseWithContext with context.Background.
+func (p *Parser) Parse(r io.Reader) error {
+	return p.ParseWithContext(context.Background(), r)
+}
+
+// ParseWithContext parses the multipart form from r.
+//
+// The source reader is consumed on an internal pump goroutine through an
+// io.Pipe so that cancellation does not depend on the parser reaching a part
+// boundary: canceling ctx closes the read side of the pipe, which unwinds the
+// parser immediately. A Read on r that is blocked when ctx is canceled is
+// expected to return ctx.Err (as request bodies do); the parser result then
+// reports ctx.Err exactly once and the pump goroutine and the pipe are
+// released before ParseWithContext returns.
+func (p *Parser) ParseWithContext(ctx context.Context, r io.Reader) (err error) {
 	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
 	defer func() {
 		deferErr := hsc.Close()
@@ -36,9 +51,78 @@ func (p *Parser) Parse(r io.Reader) (err error) {
 		}
 	}()
 
-	err = p.parse(r, hsc.IConditionJudger)
+	err = p.consume(ctx, r, hsc.IConditionJudger)
 
 	return
+}
+
+// consume runs the source reader on a pump goroutine and parses whatever the
+// pump forwards. It is the single transport path: ParseWithContext and
+// therefore every framework wrapper go through it.
+func (p *Parser) consume(
+	ctx context.Context,
+	r io.Reader,
+	hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam],
+) error {
+	pr, pw := io.Pipe()
+
+	// Exactly one terminal cause is ever reported on the pipe: the source
+	// error, io.EOF on a complete stream, or ctx.Err on cancellation.
+	var closeOnce sync.Once
+	closeRead := func(cause error) {
+		closeOnce.Do(func() {
+			pr.CloseWithError(cause)
+		})
+	}
+
+	var pumpDone sync.WaitGroup
+	pumpDone.Add(1)
+	go func() {
+		defer pumpDone.Done()
+		// Closing the writer after the pump stops releases the pipe even when
+		// the parser has already been unblocked by closing the reader.
+		defer pw.Close()
+
+		buf := make([]byte, 32*1024)
+		for {
+			n, readErr := r.Read(buf)
+			if n > 0 {
+				pending := buf[:n]
+				for len(pending) > 0 {
+					m, writeErr := pw.Write(pending)
+					pending = pending[m:]
+					if writeErr != nil {
+						// The read side was closed (cancellation). The
+						// terminal cause was already recorded there.
+						return
+					}
+				}
+			}
+			if readErr != nil {
+				if errors.Is(readErr, io.EOF) {
+					closeRead(nil)
+				} else {
+					closeRead(readErr)
+				}
+				return
+			}
+		}
+	}()
+	// AfterFunc fires in its own goroutine, so cancellation is delivered even
+	// while the parser is blocked inside a hook or a pipe read.
+	stopAfterFunc := context.AfterFunc(ctx, func() {
+		closeRead(ctx.Err())
+	})
+	defer stopAfterFunc()
+
+	parseErr := p.parse(pr, hsc)
+
+	// Make sure the pump has observed the closed pipe before returning so no
+	// transport goroutine outlives the call.
+	_ = pr.Close()
+	pumpDone.Wait()
+
+	return parseErr
 }
 
 func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
@@ -144,15 +228,31 @@ type abnormalParam struct {
 }
 
 type preProcessor struct {
-	config *parserConfig
-	offset int64
-	file   *os.File
+	config    *parserConfig
+	offset    int64
+	file      tempFile
+	activeMem []*customReadCloser
 }
 
 var bufPool = sync.Pool{
 	New: func() interface{} {
 		return new(bytes.Buffer)
 	},
+}
+
+// tempFile is the on-disk spill target. It is an internal seam: production
+// uses newTempFile below (os.CreateTemp, the only algorithm in this path),
+// while tests substitute a fault-injecting writer that runs through the exact
+// same io.Copy logic.
+type tempFile interface {
+	io.Writer
+	io.ReaderAt
+	io.Closer
+	Name() string
+}
+
+var newTempFile = func() (tempFile, error) {
+	return os.CreateTemp("", "formstream-")
 }
 
 func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
@@ -165,14 +265,16 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 	memLimit := min(pp.config.maxMemFileSize, pp.config.maxMemSize)
 	n, err := io.CopyN(buf, normalParam.r, int64(memLimit)+1)
 	if err != nil && !errors.Is(err, io.EOF) {
+		bufPool.Put(buf)
 		return nil, fmt.Errorf("failed to copy: %w", err)
 	}
 
 	var content io.ReadCloser
 	if DataSize(n) > memLimit {
 		if pp.file == nil {
-			f, err := os.CreateTemp("", "formstream-")
+			f, err := newTempFile()
 			if err != nil {
+				bufPool.Put(buf)
 				return nil, fmt.Errorf("failed to create temp file: %w", err)
 			}
 			pp.file = f
@@ -180,11 +282,13 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 
 		bufSize, err := io.Copy(pp.file, buf)
 		if err != nil {
+			bufPool.Put(buf)
 			return nil, fmt.Errorf("failed to write: %w", err)
 		}
 
 		remainSize, err := io.Copy(pp.file, normalParam.r)
 		if err != nil {
+			bufPool.Put(buf)
 			return nil, fmt.Errorf("failed to copy: %w", err)
 		}
 
@@ -197,15 +301,20 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 		pp.config.maxMemSize -= DataSize(buf.Len())
 		pp.config.maxMemFileSize -= DataSize(buf.Len())
 		bufSize := buf.Len()
-		content = customReadCloser{
+
+		idx := len(pp.activeMem)
+		memContent := customReadCloser{
 			Reader: buf,
 			closeFunc: func() error {
 				bufPool.Put(buf)
 				pp.config.maxMemSize += DataSize(bufSize)
 				pp.config.maxMemFileSize += DataSize(bufSize)
+				pp.activeMem[idx] = nil
 				return nil
 			},
 		}
+		pp.activeMem = append(pp.activeMem, &memContent)
+		content = memContent
 	}
 
 	return &abnormalParam{
@@ -215,8 +324,22 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 }
 
 func (pp *preProcessor) Close() error {
+	// Release memory contents of hooks that were buffered waiting for their
+	// required parts but never executed because parsing failed or was
+	// canceled. Closing through closeFunc restores pool entries and budget
+	// counters exactly once (already-closed entries are nil).
+	var errs []error
+	for _, c := range pp.activeMem {
+		if c != nil {
+			if err := c.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	pp.activeMem = nil
+
 	if pp.file == nil {
-		return nil
+		return errors.Join(errs...)
 	}
 
 	filepath := pp.file.Name()
@@ -229,10 +352,10 @@ func (pp *preProcessor) Close() error {
 
 	// Return combined errors if any
 	if closeErr != nil || removeErr != nil {
-		return errors.Join(closeErr, removeErr)
+		errs = append(errs, closeErr, removeErr)
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
 type judgeHook struct {
