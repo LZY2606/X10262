@@ -1,5 +1,6 @@
 package httpform
 
+import "context"
 import (
 	"io"
 	"mime"
@@ -33,4 +34,9 @@ func NewParser(req *http.Request, options ...formstream.ParserOption) (*Parser, 
 
 func (p *Parser) Parse() error {
 	return p.Parser.Parse(p.reader)
+}
+
+// ParseWithContext parses the request body until ctx is cancelled.
+func (p *Parser) ParseWithContext(ctx context.Context) error {
+	return p.Parser.ParseWithContext(ctx, p.reader)
 }

@@ -1,5 +1,6 @@
 package ginform
 
+import "context"
 import (
 	"io"
 	"mime"
@@ -35,4 +36,9 @@ func NewParser(c *gin.Context, options ...formstream.ParserOption) (*Parser, err
 // Parse parses the request body.
 func (p *Parser) Parse() error {
 	return p.Parser.Parse(p.reader)
+}
+
+// ParseWithContext parses the request body until ctx is cancelled.
+func (p *Parser) ParseWithContext(ctx context.Context) error {
+	return p.Parser.ParseWithContext(ctx, p.reader)
 }

@@ -2,6 +2,7 @@ package formstream
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -23,22 +24,51 @@ var (
 
 // Parse parses the multipart form from r.
 func (p *Parser) Parse(r io.Reader) (err error) {
+	return p.ParseWithContext(context.Background(), r)
+}
+
+// ParseWithContext parses the multipart form from r.
+//
+// The source r is streamed into the parser through an io.Pipe, so a
+// cancellation of ctx interrupts the parse immediately: the parser stops
+// reading, every internal goroutine and the pipe are shut down, buffered
+// parts are released and any temporary file is removed. The context error
+// is reported exactly once to the caller.
+//
+// As with any io.Reader, cancellation cannot interrupt a source whose Read
+// method never returns. Well-behaved sources (net connections, io.Pipe,
+// context-aware readers) are unblocked because the pipe is closed.
+func (p *Parser) ParseWithContext(ctx context.Context, r io.Reader) error {
 	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
-	defer func() {
-		deferErr := hsc.Close()
-		// capture the error of Close()
-		if deferErr != nil {
-			if err != nil {
-				err = errors.Join(err, deferErr)
-			} else {
-				err = deferErr
-			}
-		}
+	pr, pw := io.Pipe()
+	done := make(chan error, 1)
+
+	// Stream the source into the parser. io.Copy shares the same read path
+	// for every parse; the pipe only transports the bytes.
+	go func() {
+		_, copyErr := io.Copy(pw, r)
+		_ = pw.CloseWithError(copyErr)
 	}()
 
-	err = p.parse(r, hsc.IConditionJudger)
+	go func() {
+		parseErr := p.parse(pr, hsc.IConditionJudger)
+		closeErr := hsc.Close()
+		done <- errors.Join(parseErr, closeErr)
+	}()
 
-	return
+	select {
+	case <-ctx.Done():
+		// Closing the read end unblocks both the parser reading from the
+		// pipe and the pump blocked writing into it.
+		_ = pr.CloseWithError(ctx.Err())
+		<-done
+		return ctx.Err()
+	case err := <-done:
+		// The parser is finished; release a pump possibly blocked on a
+		// source that still has unread bytes.
+		_ = pr.Close()
+		return err
+	}
 }
 
 func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
@@ -112,6 +142,29 @@ type hookSatisfactionChecker struct {
 	preProcessor *preProcessor
 }
 
+// spillFile is the on-disk backing store for oversized hooked parts.
+// It is a package-private seam over *os.File.
+type spillFile interface {
+	io.Writer
+	io.ReaderAt
+	io.Seeker
+	io.Closer
+	Name() string
+}
+
+func (c *parserConfig) newSpillFile() (spillFile, error) {
+	if c.newSpillFileFunc != nil {
+		return c.newSpillFileFunc()
+	}
+
+	f, err := os.CreateTemp("", "formstream-")
+	if err != nil {
+		return nil, err
+	}
+
+	return f, nil
+}
+
 func newHookSatisfactionChecker(streamHooks map[string]streamHook, config *parserConfig) *hookSatisfactionChecker {
 	judgeHooks := make(map[string]conditionjudge.Hook[string, *normalParam, *abnormalParam], len(streamHooks))
 	for name, hook := range streamHooks {
@@ -146,7 +199,7 @@ type abnormalParam struct {
 type preProcessor struct {
 	config *parserConfig
 	offset int64
-	file   *os.File
+	file   spillFile
 }
 
 var bufPool = sync.Pool{
@@ -171,7 +224,7 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 	var content io.ReadCloser
 	if DataSize(n) > memLimit {
 		if pp.file == nil {
-			f, err := os.CreateTemp("", "formstream-")
+			f, err := pp.config.newSpillFile()
 			if err != nil {
 				return nil, fmt.Errorf("failed to create temp file: %w", err)
 			}

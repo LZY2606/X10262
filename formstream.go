@@ -37,6 +37,11 @@ type parserConfig struct {
 	maxHeaders     uint
 	maxMemSize     DataSize
 	maxMemFileSize DataSize
+	// newSpillFile creates the backing file used when a hooked part does
+	// not fit in memory. It is package-private on purpose: the production
+	// path always defaults to os.CreateTemp, tests only swap the writer
+	// semantics. Every byte still flows through the same preProcessor logic.
+	newSpillFileFunc func() (spillFile, error)
 }
 
 type ParserOption func(*parserConfig)
