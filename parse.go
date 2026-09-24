@@ -23,25 +23,63 @@ var (
 
 // Parse parses the multipart form from r.
 func (p *Parser) Parse(r io.Reader) (err error) {
-	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
+	// Parse must be retry-safe: resource budgets are consumed while
+	// streaming, so a copy of the configured budgets is used per call and
+	// shared state is rolled back on failure. A Parse call that errors out
+	// therefore never leaves the parser half-updated and a retry with the
+	// same input produces the same result as a first successful attempt.
+	cfg := p.parserConfig
+	originalValues := make(map[string]int, len(p.valueMap))
+	for key, values := range p.valueMap {
+		originalValues[key] = len(values)
+	}
+
+	hsc := newHookSatisfactionChecker(p.hookMap, &cfg)
 	defer func() {
-		deferErr := hsc.Close()
-		// capture the error of Close()
-		if deferErr != nil {
+		// Release every parameter buffered for hooks whose requirements
+		// never appeared, on both success and error paths, otherwise the
+		// spooled memory or temp-file sections would outlive the call.
+		var errs []error
+		if abandonErr := hsc.Abandon(); abandonErr != nil {
+			errs = append(errs, abandonErr)
+		}
+
+		if err != nil {
+			// Restore the value map to the state observed before this call
+			// so a failed attempt never leaves shared state half-updated.
+			for key, n := range originalValues {
+				if len(p.valueMap[key]) > n {
+					p.valueMap[key] = p.valueMap[key][:n]
+				}
+			}
+			for key := range p.valueMap {
+				if _, ok := originalValues[key]; !ok {
+					delete(p.valueMap, key)
+				}
+			}
+		}
+
+		if closeErr := hsc.Close(); closeErr != nil {
+			errs = append(errs, closeErr)
+		}
+
+		// Every failure cause is joined at most once: the streaming error
+		// from the main flow plus cleanup errors, each with its own context.
+		if len(errs) != 0 {
 			if err != nil {
-				err = errors.Join(err, deferErr)
+				err = errors.Join(append([]error{err}, errs...)...)
 			} else {
-				err = deferErr
+				err = errors.Join(errs...)
 			}
 		}
 	}()
 
-	err = p.parse(r, hsc.IConditionJudger)
+	err = p.parse(r, hsc.IConditionJudger, &cfg)
 
 	return
 }
 
-func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
+func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam], cfg *parserConfig) error {
 	mr := multipart.NewReader(r, p.boundary)
 	for {
 		var part *multipart.Part
@@ -53,16 +91,16 @@ func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, 
 			return fmt.Errorf("failed to read next part: %w", err)
 		}
 
-		if p.maxParts == 0 {
+		if cfg.maxParts == 0 {
 			return ErrTooManyParts
 		}
-		p.maxParts--
+		cfg.maxParts--
 
 		for _, header := range part.Header {
-			if p.maxHeaders < uint(len(header)) {
+			if cfg.maxHeaders < uint(len(header)) {
 				return ErrTooManyHeaders
 			}
-			p.maxHeaders -= uint(len(header))
+			cfg.maxHeaders -= uint(len(header))
 		}
 
 		header := newHeader(part.Header)
@@ -77,20 +115,20 @@ func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, 
 		} else {
 			b := new(bytes.Buffer)
 
-			if DataSize(len(part.FormName())) > p.maxMemSize {
+			if DataSize(len(part.FormName())) > cfg.maxMemSize {
 				return ErrTooLargeForm
 			}
-			p.maxMemSize -= DataSize(len(part.FormName()))
+			cfg.maxMemSize -= DataSize(len(part.FormName()))
 
 			n, err := io.Copy(b, part)
 			if err != nil {
 				return fmt.Errorf("failed to copy part: %w", err)
 			}
 
-			if uint64(n) > uint64(p.maxMemSize) {
+			if uint64(n) > uint64(cfg.maxMemSize) {
 				return ErrTooLargeForm
 			}
-			p.maxMemSize -= DataSize(n)
+			cfg.maxMemSize -= DataSize(n)
 
 			p.valueMap[part.FormName()] = append(p.valueMap[part.FormName()], Value{
 				content: b.Bytes(),
@@ -141,6 +179,17 @@ type normalParam struct {
 type abnormalParam struct {
 	content io.ReadCloser
 	header  Header
+}
+
+// Close releases the spooled content backing this buffered hook parameter.
+// It allows the condition judger's generic Abandon path to free the
+// resource without duplicating production resource logic for tests.
+func (p *abnormalParam) Close() error {
+	if p.content == nil {
+		return nil
+	}
+
+	return p.content.Close()
 }
 
 type preProcessor struct {

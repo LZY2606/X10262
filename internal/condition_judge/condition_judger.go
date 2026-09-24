@@ -9,6 +9,10 @@ type IConditionJudger[K comparable, S any, T any] interface {
 	IsHookExist(key K) bool
 	HookEvent(key K, value S) (bool, error)
 	KeyEvent(key K) error
+	// Abandon releases every parameter still buffered for unsatisfied hooks.
+	// It is invoked when processing stops before requirements could be met,
+	// e.g. the source failed or the caller cancelled the request.
+	Abandon() error
 }
 
 // ConditionJudger If the condition is met, execute immediately; if not, wait until it is met and execute.
@@ -126,6 +130,31 @@ func (w *ConditionJudger[K, S, T]) KeyEvent(key K) error {
 			}
 		}
 		hook.callParams = nil
+	}
+	if len(errs) != 0 {
+		return errors.Join(errs...)
+	}
+
+	return nil
+}
+
+// Abandon drops all parameters buffered for hooks whose requirements were
+// never satisfied. It must be called once when processing terminates without
+// reaching the satisfied state so that buffered resources (such as spooled
+// file contents) are returned even on error paths. Calling Abandon after the
+// requirements were satisfied, or more than once, has no effect.
+func (w *ConditionJudger[K, S, T]) Abandon() error {
+	var errs []error
+	for key, hook := range w.unsatisfiedHookMap {
+		for _, param := range hook.callParams {
+			if closer, ok := any(param).(interface{ Close() error }); ok {
+				if err := closer.Close(); err != nil {
+					errs = append(errs, fmt.Errorf("failed to abandon hook(%v) param: %w", key, err))
+				}
+			}
+		}
+		hook.callParams = nil
+		delete(w.unsatisfiedHookMap, key)
 	}
 	if len(errs) != 0 {
 		return errors.Join(errs...)

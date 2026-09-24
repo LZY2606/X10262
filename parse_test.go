@@ -245,7 +245,7 @@ func TestParser_Parse(t *testing.T) {
 					maxMemFileSize: 1024,
 				},
 			}
-			err := parser.parse(strings.NewReader(tc.inputFormData), mockJudger)
+			err := parser.parse(strings.NewReader(tc.inputFormData), mockJudger, &parser.parserConfig)
 
 			for k, v := range tc.outputValueMap {
 				if len(parser.valueMap[k]) != len(v) {
