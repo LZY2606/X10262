@@ -146,7 +146,26 @@ type abnormalParam struct {
 type preProcessor struct {
 	config *parserConfig
 	offset int64
-	file   *os.File
+	file   tempFile
+}
+
+// tempFile is the on-disk spill destination used by the pre-processor when a
+// part exceeds the memory budget. It is a package-private seam: the production
+// implementation is backed by an *os.File created with os.CreateTemp, while
+// tests can substitute a fault-injecting file without changing the surrounding
+// buffering, offset or cleanup logic.
+type tempFile interface {
+	io.Writer
+	io.ReaderAt
+	Name() string
+	Close() error
+}
+
+// createTempFile is the production temp-file constructor. It is a variable so
+// package-internal tests can inject short-writing or failing files; the write
+// and cleanup path exercised by tests is the same one used in production.
+var createTempFile = func() (tempFile, error) {
+	return os.CreateTemp("", "formstream-")
 }
 
 var bufPool = sync.Pool{
@@ -165,14 +184,16 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 	memLimit := min(pp.config.maxMemFileSize, pp.config.maxMemSize)
 	n, err := io.CopyN(buf, normalParam.r, int64(memLimit)+1)
 	if err != nil && !errors.Is(err, io.EOF) {
+		bufPool.Put(buf)
 		return nil, fmt.Errorf("failed to copy: %w", err)
 	}
 
 	var content io.ReadCloser
 	if DataSize(n) > memLimit {
 		if pp.file == nil {
-			f, err := os.CreateTemp("", "formstream-")
+			f, err := createTempFile()
 			if err != nil {
+				bufPool.Put(buf)
 				return nil, fmt.Errorf("failed to create temp file: %w", err)
 			}
 			pp.file = f
@@ -180,11 +201,13 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 
 		bufSize, err := io.Copy(pp.file, buf)
 		if err != nil {
+			bufPool.Put(buf)
 			return nil, fmt.Errorf("failed to write: %w", err)
 		}
 
 		remainSize, err := io.Copy(pp.file, normalParam.r)
 		if err != nil {
+			bufPool.Put(buf)
 			return nil, fmt.Errorf("failed to copy: %w", err)
 		}
 
