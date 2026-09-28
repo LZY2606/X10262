@@ -149,22 +149,50 @@ type preProcessor struct {
 	file   *os.File
 }
 
-var bufPool = sync.Pool{
+var rawBufPool = sync.Pool{
 	New: func() interface{} {
 		return new(bytes.Buffer)
 	},
 }
 
-func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
-	buf, ok := bufPool.Get().(*bytes.Buffer)
+// bufferPool is the temporary buffer pool used by (*preProcessor).run.
+// preProcessorBufferPool is intentionally unexported: production uses the
+// sync.Pool-backed implementation below, and package-internal tests may
+// temporarily install a counting implementation to assert Get/Put balance.
+// Both share the exact same (*preProcessor).run code path; no test-only
+// algorithm is duplicated.
+var preProcessorBufferPool bufferPool = syncBufferPool{pool: &rawBufPool}
+
+type bufferPool interface {
+	Get() *bytes.Buffer
+	Put(*bytes.Buffer)
+}
+
+type syncBufferPool struct {
+	pool *sync.Pool
+}
+
+func (p syncBufferPool) Get() *bytes.Buffer {
+	buf, ok := p.pool.Get().(*bytes.Buffer)
 	if !ok {
-		buf = new(bytes.Buffer)
+		return new(bytes.Buffer)
 	}
+
+	return buf
+}
+
+func (p syncBufferPool) Put(buf *bytes.Buffer) {
+	p.pool.Put(buf)
+}
+
+func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
+	buf := preProcessorBufferPool.Get()
 	buf.Reset()
 
 	memLimit := min(pp.config.maxMemFileSize, pp.config.maxMemSize)
 	n, err := io.CopyN(buf, normalParam.r, int64(memLimit)+1)
 	if err != nil && !errors.Is(err, io.EOF) {
+		preProcessorBufferPool.Put(buf)
 		return nil, fmt.Errorf("failed to copy: %w", err)
 	}
 
@@ -173,6 +201,7 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 		if pp.file == nil {
 			f, err := os.CreateTemp("", "formstream-")
 			if err != nil {
+				preProcessorBufferPool.Put(buf)
 				return nil, fmt.Errorf("failed to create temp file: %w", err)
 			}
 			pp.file = f
@@ -180,11 +209,13 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 
 		bufSize, err := io.Copy(pp.file, buf)
 		if err != nil {
+			preProcessorBufferPool.Put(buf)
 			return nil, fmt.Errorf("failed to write: %w", err)
 		}
 
 		remainSize, err := io.Copy(pp.file, normalParam.r)
 		if err != nil {
+			preProcessorBufferPool.Put(buf)
 			return nil, fmt.Errorf("failed to copy: %w", err)
 		}
 
@@ -192,7 +223,7 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 		content = io.NopCloser(io.NewSectionReader(pp.file, pp.offset, size))
 		pp.offset += size
 
-		bufPool.Put(buf)
+		preProcessorBufferPool.Put(buf)
 	} else {
 		pp.config.maxMemSize -= DataSize(buf.Len())
 		pp.config.maxMemFileSize -= DataSize(buf.Len())
@@ -200,7 +231,7 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 		content = customReadCloser{
 			Reader: buf,
 			closeFunc: func() error {
-				bufPool.Put(buf)
+				preProcessorBufferPool.Put(buf)
 				pp.config.maxMemSize += DataSize(bufSize)
 				pp.config.maxMemFileSize += DataSize(bufSize)
 				return nil
