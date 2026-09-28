@@ -23,7 +23,12 @@ var (
 
 // Parse parses the multipart form from r.
 func (p *Parser) Parse(r io.Reader) (err error) {
-	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
+	// Parsing mutates resource counters on parserConfig (maxParts, maxHeaders
+	// and maxMemSize). Work on a private copy so that a failed parse cannot
+	// half-update the parser's configured budgets and the same parser can be
+	// retried with identical results.
+	config := p.parserConfig
+	hsc := newHookSatisfactionChecker(p.hookMap, &config)
 	defer func() {
 		deferErr := hsc.Close()
 		// capture the error of Close()
@@ -33,6 +38,22 @@ func (p *Parser) Parse(r io.Reader) (err error) {
 			} else {
 				err = deferErr
 			}
+		}
+	}()
+
+	// Only commit parsed values after the whole form succeeds, so that an
+	// aborted parse leaves neither fields nor counters in a half-updated
+	// state. Parsing writes into a private copy; the parser's valueMap is
+	// restored to its pre-parse snapshot on failure.
+	rollback := p.valueMap
+	working := make(map[string][]Value, len(rollback))
+	for key, values := range rollback {
+		working[key] = append([]Value(nil), values...)
+	}
+	p.valueMap = working
+	defer func() {
+		if err != nil {
+			p.valueMap = rollback
 		}
 	}()
 
@@ -53,55 +74,70 @@ func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, 
 			return fmt.Errorf("failed to read next part: %w", err)
 		}
 
-		if p.maxParts == 0 {
-			return ErrTooManyParts
-		}
-		p.maxParts--
-
-		for _, header := range part.Header {
-			if p.maxHeaders < uint(len(header)) {
-				return ErrTooManyHeaders
-			}
-			p.maxHeaders -= uint(len(header))
-		}
-
-		header := newHeader(part.Header)
-		if hsc.IsHookExist(part.FormName()) {
-			_, err := hsc.HookEvent(part.FormName(), &normalParam{
-				r: part,
-				h: header,
-			})
-			if err != nil {
-				return fmt.Errorf("failed to run or set hook: %w", err)
-			}
-		} else {
-			b := new(bytes.Buffer)
-
-			if DataSize(len(part.FormName())) > p.maxMemSize {
-				return ErrTooLargeForm
-			}
-			p.maxMemSize -= DataSize(len(part.FormName()))
-
-			n, err := io.Copy(b, part)
-			if err != nil {
-				return fmt.Errorf("failed to copy part: %w", err)
-			}
-
-			if uint64(n) > uint64(p.maxMemSize) {
-				return ErrTooLargeForm
-			}
-			p.maxMemSize -= DataSize(n)
-
-			p.valueMap[part.FormName()] = append(p.valueMap[part.FormName()], Value{
-				content: b.Bytes(),
-				header:  header,
-			})
-		}
-
-		err = hsc.KeyEvent(part.FormName())
+		err = p.processPart(part, hsc)
 		if err != nil {
-			return fmt.Errorf("failed to run satisfied hook: %w", err)
+			// Drain the remainder of the current part. When the source is a
+			// streaming producer (e.g. io.Pipe), an error path that leaves an
+			// unconsumed part would block the producer forever and leak the
+			// goroutine and pipe. multipart.Reader drains here itself when
+			// NextPart advances, but aborted parses never advance again.
+			_, _ = io.Copy(io.Discard, part)
+			return err
 		}
+	}
+
+	return nil
+}
+
+func (p *Parser) processPart(part *multipart.Part, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
+	if p.maxParts == 0 {
+		return ErrTooManyParts
+	}
+	p.maxParts--
+
+	for _, header := range part.Header {
+		if p.maxHeaders < uint(len(header)) {
+			return ErrTooManyHeaders
+		}
+		p.maxHeaders -= uint(len(header))
+	}
+
+	header := newHeader(part.Header)
+	if hsc.IsHookExist(part.FormName()) {
+		_, err := hsc.HookEvent(part.FormName(), &normalParam{
+			r: part,
+			h: header,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to run or set hook: %w", err)
+		}
+	} else {
+		b := new(bytes.Buffer)
+
+		if DataSize(len(part.FormName())) > p.maxMemSize {
+			return ErrTooLargeForm
+		}
+		p.maxMemSize -= DataSize(len(part.FormName()))
+
+		n, err := io.Copy(b, part)
+		if err != nil {
+			return fmt.Errorf("failed to copy part: %w", err)
+		}
+
+		if uint64(n) > uint64(p.maxMemSize) {
+			return ErrTooLargeForm
+		}
+		p.maxMemSize -= DataSize(n)
+
+		p.valueMap[part.FormName()] = append(p.valueMap[part.FormName()], Value{
+			content: b.Bytes(),
+			header:  header,
+		})
+	}
+
+	err := hsc.KeyEvent(part.FormName())
+	if err != nil {
+		return fmt.Errorf("failed to run satisfied hook: %w", err)
 	}
 
 	return nil
@@ -147,6 +183,11 @@ type preProcessor struct {
 	config *parserConfig
 	offset int64
 	file   *os.File
+	// pending holds in-memory contents buffered for hooks whose required
+	// parts have not arrived yet. They must be returned to the pool (and
+	// their memory budget restored) when the parse ends before the hook ran,
+	// otherwise a failed parse leaks pool buffers and budget.
+	pending []customReadCloser
 }
 
 var bufPool = sync.Pool{
@@ -165,6 +206,7 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 	memLimit := min(pp.config.maxMemFileSize, pp.config.maxMemSize)
 	n, err := io.CopyN(buf, normalParam.r, int64(memLimit)+1)
 	if err != nil && !errors.Is(err, io.EOF) {
+		bufPool.Put(buf)
 		return nil, fmt.Errorf("failed to copy: %w", err)
 	}
 
@@ -173,6 +215,7 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 		if pp.file == nil {
 			f, err := os.CreateTemp("", "formstream-")
 			if err != nil {
+				bufPool.Put(buf)
 				return nil, fmt.Errorf("failed to create temp file: %w", err)
 			}
 			pp.file = f
@@ -180,11 +223,13 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 
 		bufSize, err := io.Copy(pp.file, buf)
 		if err != nil {
+			bufPool.Put(buf)
 			return nil, fmt.Errorf("failed to write: %w", err)
 		}
 
 		remainSize, err := io.Copy(pp.file, normalParam.r)
 		if err != nil {
+			bufPool.Put(buf)
 			return nil, fmt.Errorf("failed to copy: %w", err)
 		}
 
@@ -197,15 +242,23 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 		pp.config.maxMemSize -= DataSize(buf.Len())
 		pp.config.maxMemFileSize -= DataSize(buf.Len())
 		bufSize := buf.Len()
-		content = customReadCloser{
+
+		var closed bool
+		rc := customReadCloser{
 			Reader: buf,
 			closeFunc: func() error {
+				if closed {
+					return nil
+				}
+				closed = true
 				bufPool.Put(buf)
 				pp.config.maxMemSize += DataSize(bufSize)
 				pp.config.maxMemFileSize += DataSize(bufSize)
 				return nil
 			},
 		}
+		pp.pending = append(pp.pending, rc)
+		content = rc
 	}
 
 	return &abnormalParam{
@@ -215,6 +268,13 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 }
 
 func (pp *preProcessor) Close() error {
+	// Release every in-memory content that was buffered for a hook which
+	// never ran (canceled or otherwise aborted parse).
+	for _, content := range pp.pending {
+		_ = content.Close()
+	}
+	pp.pending = nil
+
 	if pp.file == nil {
 		return nil
 	}
